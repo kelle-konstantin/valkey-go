@@ -42,6 +42,10 @@ func newSentinelClient(opt *ClientOption, connFn connFn, retryer retryHandler) (
 		return nil, ErrInvalidTopologyRefreshInterval
 	}
 
+	if opt.RouteByLatency && opt.SendToReplicas == nil && !opt.ReplicaOnly {
+		opt.SendToReplicas = func(cmd Completed) bool { return true }
+	}
+
 	if opt.SendToReplicas != nil || opt.ReplicaOnly {
 		rOpt := *opt
 		rOpt.ReplicaOnly = true
@@ -802,7 +806,7 @@ func (c *sentinelClient) listWatch(cc conn) (master string, replica string, sent
 
 	// we return a slave address instead of master
 	if c.replica {
-		addr, err := pickReplica(resp.s[1], c.currentReplica())
+		addr, err := c.pickReplica(resp.s[1], c.currentReplica())
 		if err != nil {
 			return "", "", nil, err
 		}
@@ -812,7 +816,7 @@ func (c *sentinelClient) listWatch(cc conn) (master string, replica string, sent
 
 	var r string
 	if c.mOpt.SendToReplicas != nil {
-		addr, err := pickReplica(resp.s[2], c.currentReplica())
+		addr, err := c.pickReplica(resp.s[2], c.currentReplica())
 		if err != nil {
 			return "", "", nil, err
 		}
@@ -829,16 +833,8 @@ func (c *sentinelClient) listWatch(cc conn) (master string, replica string, sent
 
 // pickReplica chooses which replica to talk to. current is the address already
 // in use, if any: it is kept whenever it is still eligible, and only a client
-// that has none, or whose replica has gone away, draws a new one at random.
-//
-// The random draw spreads clients over the replicas, but it belongs at the
-// point where a client needs a replica, not at every refresh. Refresh used to
-// happen only on a sentinel event, so re-drawing there was rare; with
-// TopologyRefreshInterval it happens on every tick, and _switchTarget closes
-// the connection it replaces immediately, so a fresh draw on each tick would
-// tear down a working replica connection — and the requests in flight on it —
-// several times a minute for no reason.
-func pickReplica(resp ValkeyResult, current string) (string, error) {
+// that has none, or whose replica has gone away, draws a new one (via latency check or at random).
+func (c *sentinelClient) pickReplica(resp ValkeyResult, current string) (string, error) {
 	replicas, err := resp.ToArray()
 	if err != nil {
 		return "", err
@@ -869,7 +865,79 @@ func pickReplica(resp ValkeyResult, current string) (string, error) {
 		}
 	}
 
+	if c.mOpt != nil && c.mOpt.RouteByLatency && len(eligible) > 1 {
+		return c.pickLowestLatencyReplica(eligible)
+	}
+
 	// choose a replica randomly
+	m := eligible[util.FastRand(len(eligible))]
+	return net.JoinHostPort(m["ip"], m["port"]), nil
+}
+
+func (c *sentinelClient) pickLowestLatencyReplica(eligible []map[string]string) (string, error) {
+	type latencyResult struct {
+		addr string
+		rtt  time.Duration
+		err  error
+	}
+
+	results := make(chan latencyResult, len(eligible))
+	dialer := c.mOpt.Dialer
+	timeout := dialer.Timeout
+	if timeout <= 0 {
+		timeout = 500 * time.Millisecond
+	}
+
+	for _, rep := range eligible {
+		addr := net.JoinHostPort(rep["ip"], rep["port"])
+		go func(targetAddr string) {
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+
+			start := time.Now()
+			conn, err := dialer.DialContext(ctx, "tcp", targetAddr)
+			if err != nil {
+				results <- latencyResult{addr: targetAddr, err: err}
+				return
+			}
+			defer conn.Close()
+
+			_ = conn.SetDeadline(time.Now().Add(timeout))
+			// Send Valkey PING command to measure actual engine RTT
+			if _, err := conn.Write([]byte("*1\r\n$4\r\nPING\r\n")); err == nil {
+				var buf [7]byte
+				_, _ = conn.Read(buf[:])
+			}
+
+			rtt := time.Since(start)
+			results <- latencyResult{addr: targetAddr, rtt: rtt}
+		}(addr)
+	}
+
+	var bestAddr string
+	var minRTT time.Duration = time.Hour
+	var fallbackAddr string
+
+	for range eligible {
+		res := <-results
+		if res.err == nil {
+			if fallbackAddr == "" {
+				fallbackAddr = res.addr
+			}
+			if res.rtt < minRTT {
+				minRTT = res.rtt
+				bestAddr = res.addr
+			}
+		}
+	}
+
+	if bestAddr != "" {
+		return bestAddr, nil
+	}
+	if fallbackAddr != "" {
+		return fallbackAddr, nil
+	}
+
 	m := eligible[util.FastRand(len(eligible))]
 	return net.JoinHostPort(m["ip"], m["port"]), nil
 }
