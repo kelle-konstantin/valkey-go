@@ -892,8 +892,11 @@ func (c *sentinelClient) pickLowestLatencyReplica(eligible []map[string]string, 
 	}
 
 	results := make(chan latencyResult, len(eligible))
-	dialer := c.mOpt.Dialer
-	timeout := dialer.Timeout
+	dialOpt := c.mOpt
+	if c.rOpt != nil {
+		dialOpt = c.rOpt
+	}
+	timeout := dialOpt.Dialer.Timeout
 	if timeout <= 0 {
 		timeout = 500 * time.Millisecond
 	}
@@ -905,7 +908,7 @@ func (c *sentinelClient) pickLowestLatencyReplica(eligible []map[string]string, 
 			defer cancel()
 
 			start := time.Now()
-			conn, err := dialer.DialContext(ctx, "tcp", targetAddr)
+			conn, err := dial(ctx, targetAddr, dialOpt)
 			if err != nil {
 				results <- latencyResult{addr: targetAddr, err: err}
 				return
@@ -914,9 +917,14 @@ func (c *sentinelClient) pickLowestLatencyReplica(eligible []map[string]string, 
 
 			_ = conn.SetDeadline(time.Now().Add(timeout))
 			// Send Valkey PING command to measure actual engine RTT
-			if _, err := conn.Write([]byte("*1\r\n$4\r\nPING\r\n")); err == nil {
-				var buf [7]byte
-				_, _ = conn.Read(buf[:])
+			if _, err := conn.Write([]byte("*1\r\n$4\r\nPING\r\n")); err != nil {
+				results <- latencyResult{addr: targetAddr, err: err}
+				return
+			}
+			var buf [7]byte
+			if _, err := io.ReadFull(conn, buf[:]); err != nil || string(buf[:]) != "+PONG\r\n" {
+				results <- latencyResult{addr: targetAddr, err: errors.New("invalid ping response")}
+				return
 			}
 
 			rtt := time.Since(start)

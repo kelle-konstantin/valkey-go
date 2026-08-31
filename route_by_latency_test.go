@@ -1,8 +1,10 @@
 package valkey
 
 import (
+	"context"
 	"fmt"
 	"net"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -11,19 +13,22 @@ import (
 )
 
 func TestPickLowestLatencyReplica(t *testing.T) {
-	l1, err := net.Listen("tcp", "127.0.0.1:0")
+	var lc net.ListenConfig
+	ctx := context.Background()
+
+	l1, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to listen l1: %v", err)
 	}
 	defer l1.Close()
 
-	l2, err := net.Listen("tcp", "127.0.0.1:0")
+	l2, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to listen l2: %v", err)
 	}
 	defer l2.Close()
 
-	l3, err := net.Listen("tcp", "127.0.0.1:0")
+	l3, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to listen l3: %v", err)
 	}
@@ -102,15 +107,18 @@ func TestPickLowestLatencyReplica(t *testing.T) {
 }
 
 func TestPickLowestLatencyReplica_FailbackToFasterNode(t *testing.T) {
+	var lc net.ListenConfig
+	ctx := context.Background()
+
 	// l1 is slow remote node (currently in use)
 	// l2 is fast local node that just recovered
-	l1, err := net.Listen("tcp", "127.0.0.1:0")
+	l1, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to listen l1: %v", err)
 	}
 	defer l1.Close()
 
-	l2, err := net.Listen("tcp", "127.0.0.1:0")
+	l2, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to listen l2: %v", err)
 	}
@@ -186,11 +194,28 @@ func TestPickLowestLatencyReplica_FailbackToFasterNode(t *testing.T) {
 }
 
 func TestPickLowestLatencyReplica_WithUnreachableNodes(t *testing.T) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	var lc net.ListenConfig
+	ctx := context.Background()
+
+	l, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to listen: %v", err)
 	}
 	defer l.Close()
+
+	unreach1, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen unreach1: %v", err)
+	}
+	unreachPort1 := strconv.Itoa(unreach1.Addr().(*net.TCPAddr).Port)
+	_ = unreach1.Close()
+
+	unreach2, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen unreach2: %v", err)
+	}
+	unreachPort2 := strconv.Itoa(unreach2.Addr().(*net.TCPAddr).Port)
+	_ = unreach2.Close()
 
 	go func() {
 		for {
@@ -208,9 +233,9 @@ func TestPickLowestLatencyReplica_WithUnreachableNodes(t *testing.T) {
 	validHost, validPort, _ := net.SplitHostPort(l.Addr().String())
 
 	eligible := []map[string]string{
-		{"ip": "127.0.0.1", "port": "59991"}, // unreachable
-		{"ip": validHost, "port": validPort},   // reachable
-		{"ip": "127.0.0.1", "port": "59992"}, // unreachable
+		{"ip": "127.0.0.1", "port": unreachPort1}, // unreachable
+		{"ip": validHost, "port": validPort},      // reachable
+		{"ip": "127.0.0.1", "port": unreachPort2}, // unreachable
 	}
 
 	client := &sentinelClient{
@@ -235,19 +260,70 @@ func TestPickLowestLatencyReplica_WithUnreachableNodes(t *testing.T) {
 
 func TestSentinelAutoEnableSendToReplicasAndRefreshInterval(t *testing.T) {
 	opt := &ClientOption{
-		InitAddress:    []string{"127.0.0.1:26379"},
+		InitAddress:    []string{"127.0.0.1:0"},
 		Sentinel:       SentinelOption{MasterSet: "mymaster"},
 		RouteByLatency: true,
 	}
 
-	if opt.RouteByLatency {
-		if opt.SendToReplicas == nil && !opt.ReplicaOnly {
-			opt.SendToReplicas = func(cmd Completed) bool { return cmd.IsReadOnly() }
-		}
-		if opt.Sentinel.TopologyRefreshInterval == 0 {
-			opt.Sentinel.TopologyRefreshInterval = 10 * time.Second
-		}
+	sentinelMock := &mockConn{
+		DoMultiFn: func(cmd ...Completed) *valkeyresults {
+			return &valkeyresults{
+				s: []ValkeyResult{
+					{
+						val: slicemsg('*', []ValkeyMessage{
+							slicemsg('%', []ValkeyMessage{
+								strmsg('+', "ip"), strmsg('+', "127.0.0.1"),
+								strmsg('+', "port"), strmsg('+', "0"),
+							}),
+						}),
+					},
+					{
+						val: slicemsg('*', []ValkeyMessage{
+							strmsg('+', "127.0.1.0"),
+							strmsg('+', "10"),
+						}),
+					},
+					{
+						val: slicemsg('*', []ValkeyMessage{
+							slicemsg('%', []ValkeyMessage{
+								strmsg('+', "ip"), strmsg('+', "127.0.1.1"),
+								strmsg('+', "port"), strmsg('+', "11"),
+							}),
+						}),
+					},
+				},
+			}
+		},
 	}
+
+	client, err := newSentinelClient(
+		opt,
+		func(dst string, opt *ClientOption) conn {
+			if dst == "127.0.0.1:0" {
+				return sentinelMock
+			}
+			if dst == "127.0.1.0:10" {
+				return &mockConn{
+					DoFn: func(cmd Completed) ValkeyResult {
+						return ValkeyResult{val: slicemsg('*', []ValkeyMessage{strmsg('+', "master")})}
+					},
+				}
+			}
+			if dst == "127.0.1.1:11" {
+				return &mockConn{
+					DoFn: func(cmd Completed) ValkeyResult {
+						return ValkeyResult{val: slicemsg('*', []ValkeyMessage{strmsg('+', "slave")})}
+					},
+				}
+			}
+			return &mockConn{}
+		},
+		newRetryer(defaultRetryDelayFn),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error creating sentinel client: %v", err)
+	}
+	defer client.Close()
 
 	if opt.SendToReplicas == nil {
 		t.Fatal("expected SendToReplicas to be auto-configured")
