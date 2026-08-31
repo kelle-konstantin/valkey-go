@@ -42,8 +42,13 @@ func newSentinelClient(opt *ClientOption, connFn connFn, retryer retryHandler) (
 		return nil, ErrInvalidTopologyRefreshInterval
 	}
 
-	if opt.RouteByLatency && opt.SendToReplicas == nil && !opt.ReplicaOnly {
-		opt.SendToReplicas = func(cmd Completed) bool { return true }
+	if opt.RouteByLatency {
+		if opt.SendToReplicas == nil && !opt.ReplicaOnly {
+			opt.SendToReplicas = func(cmd Completed) bool { return cmd.IsReadOnly() }
+		}
+		if opt.Sentinel.TopologyRefreshInterval == 0 {
+			opt.Sentinel.TopologyRefreshInterval = 10 * time.Second
+		}
 	}
 
 	if opt.SendToReplicas != nil || opt.ReplicaOnly {
@@ -832,8 +837,9 @@ func (c *sentinelClient) listWatch(cc conn) (master string, replica string, sent
 }
 
 // pickReplica chooses which replica to talk to. current is the address already
-// in use, if any: it is kept whenever it is still eligible, and only a client
-// that has none, or whose replica has gone away, draws a new one (via latency check or at random).
+// in use, if any: it is kept whenever it is still eligible (unless RouteByLatency
+// discovers a significantly lower latency replica), and only a client that has none,
+// or whose replica has gone away, draws a new one (via latency check or at random).
 func (c *sentinelClient) pickReplica(resp ValkeyResult, current string) (string, error) {
 	replicas, err := resp.ToArray()
 	if err != nil {
@@ -856,6 +862,14 @@ func (c *sentinelClient) pickReplica(resp ValkeyResult, current string) (string,
 		return "", fmt.Errorf("not enough ready replicas")
 	}
 
+	if len(eligible) == 1 {
+		return net.JoinHostPort(eligible[0]["ip"], eligible[0]["port"]), nil
+	}
+
+	if c.mOpt != nil && c.mOpt.RouteByLatency {
+		return c.pickLowestLatencyReplica(eligible, current)
+	}
+
 	// stay on the replica already in use while it is still healthy
 	if current != "" {
 		for _, m := range eligible {
@@ -865,16 +879,12 @@ func (c *sentinelClient) pickReplica(resp ValkeyResult, current string) (string,
 		}
 	}
 
-	if c.mOpt != nil && c.mOpt.RouteByLatency && len(eligible) > 1 {
-		return c.pickLowestLatencyReplica(eligible)
-	}
-
 	// choose a replica randomly
 	m := eligible[util.FastRand(len(eligible))]
 	return net.JoinHostPort(m["ip"], m["port"]), nil
 }
 
-func (c *sentinelClient) pickLowestLatencyReplica(eligible []map[string]string) (string, error) {
+func (c *sentinelClient) pickLowestLatencyReplica(eligible []map[string]string, current string) (string, error) {
 	type latencyResult struct {
 		addr string
 		rtt  time.Duration
@@ -916,6 +926,8 @@ func (c *sentinelClient) pickLowestLatencyReplica(eligible []map[string]string) 
 
 	var bestAddr string
 	var minRTT time.Duration = time.Hour
+	var currentRTT time.Duration = time.Hour
+	var currentFound bool
 	var fallbackAddr string
 
 	for range eligible {
@@ -924,11 +936,21 @@ func (c *sentinelClient) pickLowestLatencyReplica(eligible []map[string]string) 
 			if fallbackAddr == "" {
 				fallbackAddr = res.addr
 			}
+			if res.addr == current {
+				currentFound = true
+				currentRTT = res.rtt
+			}
 			if res.rtt < minRTT {
 				minRTT = res.rtt
 				bestAddr = res.addr
 			}
 		}
+	}
+
+	// If current connection is still healthy and is either already the best
+	// or has negligible difference (within 200us), retain it to avoid unnecessary connection churn.
+	if currentFound && (current == bestAddr || currentRTT <= minRTT+200*time.Microsecond) {
+		return current, nil
 	}
 
 	if bestAddr != "" {
